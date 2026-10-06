@@ -6,7 +6,7 @@ import hashlib
 import inspect
 import warnings
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from typing_extensions import deprecated
 
 import torch
@@ -35,12 +35,18 @@ from torch.distributed.tensor._utils import (
     normalize_to_torch_size,
 )
 from torch.distributed.tensor.placement_types import (
+    _block_shard_local_boxes,
     _StridedShard,
+    _validate_block_shard_placements,
     Partial,
     Placement,
     Replicate,
     Shard,
 )
+
+
+if TYPE_CHECKING:
+    from torch.distributed.checkpoint.protocol import CheckpointableTensor
 
 
 __all__ = [
@@ -890,12 +896,48 @@ class DTensor(torch.Tensor):
                 "DTensor with partial placements!"
             )
 
+    def _block_shard_boxes(
+        self,
+    ) -> list[tuple[tuple[int, ...], tuple[int, ...], int, int]] | None:
+        """Boxes of the global tensor owned by this rank under BlockShard, if used."""
+        mesh = self.device_mesh
+        layout = _validate_block_shard_placements(
+            self._spec.placements, self.shape, mesh.shape
+        )
+        if layout is None:
+            return None
+        coordinate = mesh.get_coordinate()
+        if coordinate is None:
+            return []
+        return _block_shard_local_boxes(layout, mesh.shape, coordinate)
+
+    def _block_shard_checkpointable(self) -> "CheckpointableTensor | None":
+        """The local tensor declaring its BlockShard boxes as a ``CheckpointableTensor``.
+
+        A rank may own up to ``2k - 1`` boxes of the global tensor, each a run of
+        rows of the merged-view local tensor.
+        """
+        if (boxes := self._block_shard_boxes()) is None:
+            return None
+        # A view keeps the fields off the local tensor; loads still land in it
+        local: Any = self._local_tensor.view(self._local_tensor.shape)
+        local.global_shape = tuple(self.shape)
+        local.global_offsets = tuple(offset for offset, _, _, _ in boxes)
+        local.local_offsets = tuple(
+            (start,) + (0,) * (local.dim() - 1) for _, _, start, _ in boxes
+        )
+        local.local_sizes = tuple(size for _, size, _, _ in boxes)
+        return local
+
     def __create_write_items__(self, fqn: str, object: Any):
         self._raise_if_contains_partial_placements()
         from torch.distributed.checkpoint.planner_helpers import (
             _create_write_items_for_dtensor,
+            _get_checkpointable_tensor_write_items,
         )
 
+        if (local := self._block_shard_checkpointable()) is not None:
+            return _get_checkpointable_tensor_write_items(fqn, local)
         if hasattr(self._local_tensor, "__create_write_items__"):
             return self._local_tensor.__create_write_items__(fqn, object)  # type: ignore[attr-defined]
         elif isinstance(self._local_tensor, torch.Tensor):
@@ -918,7 +960,12 @@ class DTensor(torch.Tensor):
         from torch.distributed.checkpoint.planner_helpers import (
             _create_chunk_from_dtensor,
         )
+        from torch.distributed.checkpoint.protocol import (
+            _get_checkpointable_tensor_chunks,
+        )
 
+        if (local := self._block_shard_checkpointable()) is not None:
+            return _get_checkpointable_tensor_chunks(local)
         if hasattr(self._local_tensor, "__create_chunk_list__"):
             return self._local_tensor.__create_chunk_list__()  # type: ignore[attr-defined]
         elif isinstance(self._local_tensor, torch.Tensor):
@@ -928,6 +975,12 @@ class DTensor(torch.Tensor):
 
     def __get_tensor_shard__(self, index):
         self._raise_if_contains_partial_placements()
+        if (local := self._block_shard_checkpointable()) is not None:
+            from torch.distributed.checkpoint.protocol import (
+                _get_checkpointable_tensor_shard,
+            )
+
+            return _get_checkpointable_tensor_shard(local, index)
         if hasattr(self._local_tensor, "__get_tensor_shard__"):
             return self._local_tensor.__get_tensor_shard__(index)  # type: ignore[attr-defined]
         elif isinstance(self._local_tensor, torch.Tensor):
